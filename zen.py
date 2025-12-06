@@ -1,32 +1,30 @@
 import asyncio
 import os
+import re
 from telethon import TelegramClient, errors
 
-class TelegramForwarder:
+class CAExtractor:
     def __init__(self, api_id, api_hash, phone_number):
         self.api_id = api_id
         self.api_hash = api_hash
         self.phone_number = phone_number
-        # Session dosyası: telefon numarasına özel
         self.client = TelegramClient(f'session_{phone_number}', api_id, api_hash)
 
     async def safe_input(self, prompt: str) -> str:
-        """Async ortamda güvenli input almak için."""
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, input, prompt)
 
     async def ensure_authorized(self):
-        """Oturum açık ve yetkilendirilmiş mi diye kontrol eder."""
         if not self.client.is_connected():
             await self.client.connect()
         if not await self.client.is_user_authorized():
-            print("Telefon numaranızla giriş yapılıyor...")
+            print("🔐 Telegram hesabıyla giriş yapılıyor...")
             await self.client.send_code_request(self.phone_number)
-            code = await self.safe_input('Telegram’dan gelen doğrulama kodunu girin: ')
+            code = await self.safe_input('Doğrulama kodunu girin: ')
             try:
                 await self.client.sign_in(self.phone_number, code)
             except errors.SessionPasswordNeededError:
-                password = await self.safe_input('İki faktörlü doğrulama şifrenizi girin: ')
+                password = await self.safe_input('2FA şifrenizi girin: ')
                 await self.client.sign_in(password=password)
 
     async def list_chats(self):
@@ -35,66 +33,77 @@ class TelegramForwarder:
         filename = f"chats_of_{self.phone_number}.txt"
         with open(filename, "w", encoding="utf-8") as f:
             for dialog in dialogs:
-                chat_info = f"Chat ID: {dialog.id}, Title: {dialog.title}\n"
-                print(chat_info.strip())
-                f.write(chat_info)
+                info = f"Chat ID: {dialog.id}, Title: {dialog.title}\n"
+                print(info.strip())
+                f.write(info)
         print(f"\n✅ Sohbet listesi '{filename}' dosyasına kaydedildi.")
 
-    async def forward_messages_to_channel(self, source_chat_id, destination_channel_id, keywords):
+    async def extract_and_forward_ca(self, source_chat_id, destination_channel_id):
         await self.ensure_authorized()
-
-        # Son mesaj ID'sini al
         messages = await self.client.get_messages(source_chat_id, limit=1)
         last_message_id = messages[0].id if messages else 0
 
-        print(f"🔍 Kaynak sohbetten ({source_chat_id}) mesajlar izleniyor...")
+        print(f"🔍 Kaynak sohbet: {source_chat_id}")
         print(f"📤 Hedef kanal: {destination_channel_id}")
-        if keywords:
-            print(f"🔑 Anahtar kelimeler: {', '.join(kw for kw in keywords if kw)}")
-        else:
-            print("📬 Tüm mesajlar iletilecek.")
+        print("🚀 Sadece '...pump' formatındaki CA'lar iletiliyor.\n")
 
         while True:
             try:
-                messages = await self.client.get_messages(source_chat_id, min_id=last_message_id, limit=100)
+                messages = await self.client.get_messages(source_chat_id, min_id=last_message_id, limit=50)
                 if not messages:
                     await asyncio.sleep(5)
                     continue
 
-                # Mesajları eski → yeni sırayla işle
                 for message in reversed(messages):
+                    ca = None
                     text = (message.text or "").strip()
-                    if not text:
-                        continue  # Boş mesajları atla
 
-                    # Anahtar kelime kontrolü
-                    should_forward = not keywords
-                    if not should_forward:
-                        text_lower = text.lower()
-                        should_forward = any(
-                            kw.strip().lower() in text_lower
-                            for kw in keywords if kw.strip()
-                        )
+                    if text:
+                        for line in text.splitlines():
+                            line = line.strip()
+                            # Geçerli CA: sadece harf/rakam + en az 30 karakter + 'pump' ile bitmeli
+                            if (
+                                line.endswith('pump') and
+                                len(line) >= 30 and
+                                re.fullmatch(r'[A-Za-z0-9]{30,}pump', line)
+                            ):
+                                ca = line
+                                break  # İlk geçerli CA'yı al
 
-                    if should_forward:
+                    if ca:
                         try:
-                            await self.client.send_message(destination_channel_id, text)
-                            print(f"✅ İletildi: {text[:60]}{'...' if len(text) > 60 else ''}")
+                            await self.client.send_message(destination_channel_id, ca)
+                            print(f"✅ CA iletildi: {ca}")
                         except Exception as e:
                             print(f"❌ İletme hatası: {e}")
+                    else:
+                        print("ℹ️ CA bulunamadı — mesaj atlandı.")
 
                     last_message_id = max(last_message_id, message.id)
 
                 await asyncio.sleep(5)
 
+            except (ConnectionError, OSError, errors.ConnectionError, errors.ServerError) as e:
+                print(f"🔌 Bağlantı hatası: {e}")
+                print("🔁 Yeniden bağlanılıyor...")
+                await self.client.disconnect()
+                await asyncio.sleep(10)
+                await self.ensure_authorized()
+                continue
+
             except errors.FloodWaitError as e:
-                print(f"⏳ Telegram sınırı: {e.seconds} saniye beklenmeli.")
-                await asyncio.sleep(e.seconds + 5)
+                print(f"⏳ FloodWait: {e.seconds} saniye bekle.")
+                await asyncio.sleep(e.seconds + 10)
+
+            except KeyboardInterrupt:
+                print("\n⏹️  Kullanıcı tarafından durduruldu.")
+                break
+
             except Exception as e:
                 print(f"❗ Beklenmeyen hata: {e}")
                 await asyncio.sleep(10)
 
-# Yardımcı fonksiyonlar
+# --- Kimlik Bilgileri Yönetimi ---
 
 def read_credentials():
     if not os.path.exists("credentials.txt"):
@@ -112,41 +121,43 @@ def write_credentials(api_id, api_hash, phone_number):
     with open("credentials.txt", "w", encoding="utf-8") as f:
         f.write(f"{api_id}\n{api_hash}\n{phone_number}\n")
 
+# --- Ana Program ---
+
 async def main():
     api_id, api_hash, phone_number = read_credentials()
     if not all([api_id, api_hash, phone_number]):
-        print("Lütfen Telegram API bilgilerinizi girin:")
+        print("📝 Lütfen Telegram API bilgilerinizi girin:")
         api_id = input("API ID: ").strip()
         api_hash = input("API Hash: ").strip()
         phone_number = input("Telefon Numarası (örn: +905551234567): ").strip()
         write_credentials(api_id, api_hash, phone_number)
-        print("✅ Bilgiler credentials.txt dosyasına kaydedildi.\n")
+        print("✅ Bilgiler kaydedildi.\n")
 
-    forwarder = TelegramForwarder(api_id, api_hash, phone_number)
+    extractor = CAExtractor(api_id, api_hash, phone_number)
 
     print("Seçenekler:")
-    print("1. Sohbetleri Listele")
-    print("2. Mesaj İlet (Anahtar Kelime ile filtreleme opsiyonel)")
+    print("1. Sohbetleri Listele (ID öğrenmek için)")
+    print("2. CA Ayıklayıcıyı Başlat")
     choice = input("Seçiminiz (1 veya 2): ").strip()
 
     if choice == "1":
-        await forwarder.list_chats()
+        await extractor.list_chats()
     elif choice == "2":
         try:
             source = int(input("Kaynak Sohbet ID'si: ").strip())
-            dest = int(input("Hedef Kanal/Grup ID'si: ").strip())
-            kw_input = input("Anahtar kelimeler (virgülle ayır, boş bırakırsan hepsini ilet): ").strip()
-            keywords = [kw.strip() for kw in kw_input.split(",")] if kw_input else []
-            await forwarder.forward_messages_to_channel(source, dest, keywords)
+            dest = int(input("Hedef Kanal ID'si: ").strip())
+            await extractor.extract_and_forward_ca(source, dest)
         except ValueError:
-            print("❌ Geçersiz ID. Lütfen sadece sayı girin.")
+            print("❌ Lütfen geçerli sayısal ID girin.")
     else:
         print("❌ Geçersiz seçim.")
+
+# --- Başlat ---
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n⚠️ Program kullanıcı tarafından durduruldu.")
+        print("\n⏹️  Program kullanıcı tarafından sonlandırıldı.")
     except Exception as e:
         print(f"\n💥 Kritik hata: {e}")
